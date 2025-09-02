@@ -1,0 +1,21 @@
+server:
+  port: 8761
+
+spring:
+  application:
+    name: eureka-server
+
+eureka:
+  client:
+    # the registry does NOT register itself
+    register-with-eureka: false
+    fetch-registry: false
+  server:
+    # dev-only: prevents odd “self-preservation” states
+    enable-self-preservation: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

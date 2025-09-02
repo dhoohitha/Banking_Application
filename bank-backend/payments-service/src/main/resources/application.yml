@@ -1,0 +1,6 @@
+server:
+  port: 8084
+
+# toggle to simulate failures if you want
+payments:
+  simulate-failure: false

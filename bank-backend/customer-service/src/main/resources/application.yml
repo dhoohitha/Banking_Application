@@ -1,0 +1,39 @@
+server:
+  port: 8081
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:customerdb;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+    driverClassName: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update   # dev only; Flyway later if you want
+    show-sql: true
+    properties:
+      hibernate.format_sql: true
+
+notification:
+  service:
+    base-url: http://localhost:8085
+
+
+# later switch to this profile with: -Dspring.profiles.active=postgres
+---
+spring:
+  config:
+    activate:
+      on-profile: postgres
+  datasource:
+    url: jdbc:postgresql://localhost:5432/bank
+    username: bank
+    password: bank
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
