@@ -10,6 +10,8 @@ import com.bank.transactionservice.entity.LedgerEntry;
 import com.bank.transactionservice.entity.Transaction;
 import com.bank.transactionservice.entity.TransactionStatus;
 import com.bank.transactionservice.entity.TransactionType;
+import com.bank.transactionservice.outbox.OutboxEvent;
+import com.bank.transactionservice.outbox.OutboxEventRepository;
 import com.bank.transactionservice.repository.LedgerEntryRepository;
 import com.bank.transactionservice.repository.TransactionRepository;
 import jakarta.transaction.Transactional;
@@ -22,9 +24,7 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -35,115 +35,185 @@ public class TransactionAppService {
     private final AccountClient accountClient;
     private final PaymentsClient paymentsClient;
     private final NotificationClient notificationClient;
+    private final OutboxEventRepository outboxRepo; // NEW
 
     public TransactionAppService(TransactionRepository txRepo,
                                  LedgerEntryRepository ledgerRepo,
                                  AccountClient accountClient,
                                  PaymentsClient paymentsClient,
-                                 NotificationClient notificationClient) {
+                                 NotificationClient notificationClient,
+                                 OutboxEventRepository outboxRepo) {
         this.txRepo = txRepo;
         this.ledgerRepo = ledgerRepo;
         this.accountClient = accountClient;
         this.paymentsClient = paymentsClient;
         this.notificationClient = notificationClient;
+        this.outboxRepo = outboxRepo;
     }
 
     /**
      * INTERNAL transfer (account -> account within our bank)
+     * Safe flow:
+     *  - Return existing txn if externalId seen (idempotent).
+     *  - Debit source, then credit destination.
+     *  - If credit fails, compensate source (credit back) and FAIL.
+     *  - Only after both succeed: write ledger (DEBIT/CREDIT), mark COMPLETED, enqueue Outbox event.
+     *  - Notifications are non-critical (never compensate on notify failure).
      */
     @Transactional
     public TransactionResponse internalTransfer(InternalTransferRequest req) {
+        // Idempotency: if this externalId already processed, return existing txn
         Transaction existing = txRepo.findByExternalId(req.getExternalId()).orElse(null);
         if (existing != null) return toResponse(existing);
 
+        // Basic validation
+        if (req.getFromAccountId() == null || req.getToAccountId() == null || req.getAmount() == null) {
+            throw new IllegalArgumentException("fromAccountId, toAccountId and amount are required");
+        }
+        if (Objects.equals(req.getFromAccountId(), req.getToAccountId())) {
+            throw new IllegalArgumentException("fromAccountId and toAccountId must differ");
+        }
+
+        // Create PENDING transaction
         Transaction tx = new Transaction();
         tx.setExternalId(req.getExternalId());
         tx.setType(TransactionType.INTERNAL);
         tx.setStatus(TransactionStatus.PENDING);
         tx.setFromAccountId(req.getFromAccountId());
         tx.setToAccountId(req.getToAccountId());
+        tx.setCreatedAt(Instant.now());
         tx = txRepo.save(tx);
 
+        Long from = req.getFromAccountId();
+        Long to = req.getToAccountId();
+        BigDecimal amount = req.getAmount();
+
+        // 1) DEBIT source
         try {
-            accountClient.debit(req.getFromAccountId(), req.getAmount());
-            accountClient.credit(req.getToAccountId(), req.getAmount());
-
-            writeLedger(tx.getId(), req.getFromAccountId(), EntrySide.DEBIT, req.getAmount());
-            writeLedger(tx.getId(), req.getToAccountId(), EntrySide.CREDIT, req.getAmount());
-
-            tx.setStatus(TransactionStatus.COMPLETED);
-            tx = txRepo.save(tx);
-
-            // Notify (demo placeholder)
-            notificationClient.notifyTransferCompleted(
-                    null,
-                    req.getFromAccountId(),
-                    tx.getId(),
-                    req.getAmount(),
-                    "EMAIL",
-                    "demo@bank.test"
-            );
-
-        } catch (Exception ex) {
-            try { accountClient.credit(req.getFromAccountId(), req.getAmount()); } catch (Exception ignore) { }
+            accountClient.debit(from, amount);
+        } catch (Exception e) {
             tx.setStatus(TransactionStatus.FAILED);
             txRepo.save(tx);
-            throw new IllegalStateException("Internal transfer failed: " + ex.getMessage(), ex);
+            throw new IllegalStateException("Debit failed: " + e.getMessage(), e);
         }
+
+        // 2) CREDIT destination (compensate the prior debit if this fails)
+        try {
+            accountClient.credit(to, amount);
+        } catch (Exception e) {
+            try { accountClient.credit(from, amount); } catch (Exception ignore) {}
+            tx.setStatus(TransactionStatus.FAILED);
+            txRepo.save(tx);
+            throw new IllegalStateException("Credit failed: " + e.getMessage(), e);
+        }
+
+        // 3) Ledger entries (only after both postings succeeded)
+        writeLedger(tx.getId(), from, EntrySide.DEBIT, amount);
+        writeLedger(tx.getId(), to,   EntrySide.CREDIT, amount);
+
+        // 4) Mark COMPLETED and enqueue Outbox event (DB-atomic)
+        tx.setStatus(TransactionStatus.COMPLETED);
+        tx = txRepo.save(tx);
+
+        outboxRepo.save(
+            OutboxEvent.forTransferCompleted(
+                tx.getId(), tx.getExternalId(), "INTERNAL",
+                from, to, amount, Instant.now()
+            )
+        );
+
+        // 5) Non-critical notification (do not compensate if this fails)
+        try {
+            notificationClient.notifyTransferCompleted(
+                null, from, tx.getId(), amount, "EMAIL", "demo@bank.test"
+            );
+        } catch (Exception ignore) {}
 
         return toResponse(tx);
     }
 
     /**
      * EXTERNAL transfer (account -> outside bank via payments-service)
+     * Safe flow mirrors internal:
+     *  - Idempotent by externalId.
+     *  - Debit local account.
+     *  - If payment rail fails, compensate debit and FAIL.
+     *  - Write ledger (DEBIT), mark COMPLETED, enqueue Outbox event.
      */
     @Transactional
     public TransactionResponse externalTransfer(ExternalTransferRequest req) {
         Transaction existing = txRepo.findByExternalId(req.getExternalId()).orElse(null);
         if (existing != null) return toResponse(existing);
 
+        if (req.getFromAccountId() == null || req.getAmount() == null) {
+            throw new IllegalArgumentException("fromAccountId and amount are required");
+        }
+
         Transaction tx = new Transaction();
         tx.setExternalId(req.getExternalId());
         tx.setType(TransactionType.EXTERNAL);
         tx.setStatus(TransactionStatus.PENDING);
         tx.setFromAccountId(req.getFromAccountId());
+        // Keep your beneficiary encoding
         tx.setExternalBeneficiary(req.getBeneficiaryBankCode() + ":" + req.getBeneficiaryAccountNo());
+        tx.setCreatedAt(Instant.now());
         tx = txRepo.save(tx);
 
+        Long from = req.getFromAccountId();
+        BigDecimal amount = req.getAmount();
+
+        // 1) Debit local account
         try {
-            accountClient.debit(req.getFromAccountId(), req.getAmount());
-
-            boolean ok = paymentsClient.send(
-                    req.getExternalId(),
-                    req.getFromAccountId(),
-                    req.getBeneficiaryName(),
-                    req.getBeneficiaryBankCode(),
-                    req.getBeneficiaryAccountNo(),
-                    req.getAmount()
-            );
-            if (!ok) throw new IllegalStateException("Payment gateway returned FAILED");
-
-            writeLedger(tx.getId(), req.getFromAccountId(), EntrySide.DEBIT, req.getAmount());
-
-            tx.setStatus(TransactionStatus.COMPLETED);
-            tx = txRepo.save(tx);
-
-            // Notify (demo placeholder)
-            notificationClient.notifyTransferCompleted(
-                    null,
-                    req.getFromAccountId(),
-                    tx.getId(),
-                    req.getAmount(),
-                    "EMAIL",
-                    "demo@bank.test"
-            );
-
-        } catch (Exception ex) {
-            try { accountClient.credit(req.getFromAccountId(), req.getAmount()); } catch (Exception ignore) { }
+            accountClient.debit(from, amount);
+        } catch (Exception e) {
             tx.setStatus(TransactionStatus.FAILED);
             txRepo.save(tx);
-            throw new IllegalStateException("External transfer failed: " + ex.getMessage(), ex);
+            throw new IllegalStateException("Debit failed: " + e.getMessage(), e);
         }
+
+        // 2) Send via payments-service
+        boolean ok = false;
+        try {
+            ok = paymentsClient.send(
+                req.getExternalId(),
+                req.getFromAccountId(),
+                req.getBeneficiaryName(),
+                req.getBeneficiaryBankCode(),
+                req.getBeneficiaryAccountNo(),
+                req.getAmount()
+            );
+        } catch (Exception e) {
+            ok = false;
+        }
+
+        if (!ok) {
+            // Compensate the debit if the external payment failed
+            try { accountClient.credit(from, amount); } catch (Exception ignore) {}
+            tx.setStatus(TransactionStatus.FAILED);
+            txRepo.save(tx);
+            throw new IllegalStateException("External payment failed");
+        }
+
+        // 3) Ledger: money leaves the bank (DEBIT only)
+        writeLedger(tx.getId(), from, EntrySide.DEBIT, amount);
+
+        // 4) Mark COMPLETED and enqueue Outbox event
+        tx.setStatus(TransactionStatus.COMPLETED);
+        tx = txRepo.save(tx);
+
+        outboxRepo.save(
+            OutboxEvent.forTransferCompleted(
+                tx.getId(), tx.getExternalId(), "EXTERNAL",
+                from, null, amount, Instant.now()
+            )
+        );
+
+        // 5) Non-critical notification
+        try {
+            notificationClient.notifyTransferCompleted(
+                null, from, tx.getId(), amount, "EMAIL", "demo@bank.test"
+            );
+        } catch (Exception ignore) {}
 
         return toResponse(tx);
     }
@@ -197,7 +267,7 @@ public class TransactionAppService {
                     direction,
                     t.getCreatedAt()
             );
-        }).filter(i -> i != null).collect(Collectors.toList());
+        }).filter(Objects::nonNull).collect(Collectors.toList());
 
         if (from != null)   items = items.stream().filter(i -> !i.getCreatedAt().isBefore(from)).collect(Collectors.toList());
         if (to != null)     items = items.stream().filter(i -> !i.getCreatedAt().isAfter(to)).collect(Collectors.toList());
@@ -237,6 +307,8 @@ public class TransactionAppService {
         }
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
+
+    // ----------------- helpers -----------------
 
     private String safe(String s) { return s == null ? "" : s; }
 

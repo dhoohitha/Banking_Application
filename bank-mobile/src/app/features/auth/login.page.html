@@ -1,0 +1,33 @@
+<ion-content class="login-page">
+  <div class="login-container">
+    <h1 class="title">BANK</h1>
+
+    <form (ngSubmit)="onLogin()" [formGroup]="loginForm">
+      <ion-item>
+        <ion-input
+          formControlName="username"
+          type="text"
+          label="Username"
+          labelPlacement="floating"
+        ></ion-input>
+      </ion-item>
+
+      <ion-item>
+        <ion-input
+          formControlName="password"
+          type="password"
+          label="Password"
+          labelPlacement="floating"
+        ></ion-input>
+      </ion-item>
+
+      <ion-button expand="block" type="submit" class="login-btn">
+        Login
+      </ion-button>
+    </form>
+
+    <p class="register-link">
+      Don’t have an account? <a routerLink="/auth/register">Register</a>
+    </p>
+  </div>
+</ion-content>

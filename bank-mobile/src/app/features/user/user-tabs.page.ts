@@ -1,4 +1,3 @@
-// src/app/features/user/user-tabs.page.ts
 import { Component } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterModule } from '@angular/router';
@@ -42,6 +41,11 @@ import {
 
     <ion-tab-button tab="tx" [routerLink]="['/user/transactions/history']">
       <ion-label>History</ion-label>
+    </ion-tab-button>
+
+    <!-- ✅ New tab for Statements -->
+    <ion-tab-button tab="statement" [routerLink]="['/user/transactions/statement']">
+      <ion-label>Statements</ion-label>
     </ion-tab-button>
 
     <ion-tab-button tab="profile" [routerLink]="['/user/profile']">

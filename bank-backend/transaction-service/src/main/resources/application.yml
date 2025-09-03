@@ -31,4 +31,18 @@ notification:
   service:
     base-url: http://localhost:8085
 
+kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 10
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 1
+
+app:
+  kafka:
+    transfers-topic: transactions.transfers
 
